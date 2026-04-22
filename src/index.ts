@@ -71,11 +71,53 @@ interface VodApiResponse {
 //  SOOP VOD 다운로더
 // ─────────────────────────────────────────────
 
+interface Settings {
+    speedLimitMB: number | null;
+    concurrency: number; // 1 = 순차, 2이상 = 병렬
+    lastUserId: string;
+    lastOutputDir: string;
+    lastFrom: number;
+    lastTo: number | null;
+}
+
+const CONFIG_PATH = path.join(process.cwd(), "config.json");
+
+function loadConfig(): Settings {
+    try {
+        if (fs.existsSync(CONFIG_PATH)) {
+            const raw = fs.readFileSync(CONFIG_PATH, "utf8");
+            const parsed = JSON.parse(raw) as Partial<Settings>;
+            return {
+                speedLimitMB: parsed.speedLimitMB ?? null,
+                concurrency: parsed.concurrency ?? 1,
+                lastUserId: parsed.lastUserId ?? "",
+                lastOutputDir: parsed.lastOutputDir ?? "",
+                lastFrom: parsed.lastFrom ?? 1,
+                lastTo: parsed.lastTo ?? null,
+            };
+        }
+    } catch {
+        // 파일 손상 시 기본값 사용
+    }
+    return { speedLimitMB: null, concurrency: 1, lastUserId: "", lastOutputDir: "", lastFrom: 1, lastTo: null };
+}
+
+function saveConfig(settings: Settings): void {
+    try {
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(settings, null, 2), "utf8");
+    } catch {
+        // 저장 실패는 무시
+    }
+}
+
 class SoopVodDownloader {
     private rl: readline.Interface;
     private http: AxiosInstance;
+    private settings: Settings;
 
     constructor() {
+        this.settings = loadConfig();
+
         this.rl = readline.createInterface({
             input: process.stdin,
             output: process.stdout,
@@ -239,7 +281,12 @@ class SoopVodDownloader {
         }
     }
 
-    private downloadOne(vod: VodItem, outputDir: string): Promise<void> {
+    private downloadOne(
+        vod: VodItem,
+        outputDir: string,
+        speedLimitMB: number | null = null,
+        onProgress?: (line: string) => void,
+    ): Promise<void> {
         return new Promise((resolve, reject) => {
             const safeName = sanitizeFilename(vod.title);
             const outTemplate = path.join(outputDir, `${safeName}.%(ext)s`);
@@ -260,6 +307,7 @@ class SoopVodDownloader {
                 "mp4", // 세그먼트/스트림 병합 후 단일 mp4
                 "--concurrent-fragments",
                 "4", // HLS 세그먼트 병렬 다운로드
+                ...(speedLimitMB !== null ? ["--limit-rate", `${speedLimitMB}M`] : []),
                 ...(ffmpegPath ? ["--ffmpeg-location", ffmpegPath] : []),
             ];
 
@@ -269,19 +317,23 @@ class SoopVodDownloader {
             proc.stdout.on("data", (chunk: Buffer) => {
                 const line = chunk.toString().replace(/\r?\n$/, "");
                 if (line.includes("[download]") || line.includes("%")) {
-                    process.stdout.write(`\r    ${line.substring(0, 72).padEnd(72)}`);
+                    if (onProgress) {
+                        onProgress(line);
+                    } else {
+                        process.stdout.write(`\r    ${line.substring(0, 72).padEnd(72)}`);
+                    }
                 }
             });
 
             proc.stderr.on("data", (chunk: Buffer) => {
                 const line = chunk.toString().trim();
                 if (line && !line.startsWith("WARNING") && !line.startsWith("[debug]")) {
-                    process.stderr.write(`\n    [경고] ${line}\n`);
+                    if (!onProgress) process.stderr.write(`\n    [경고] ${line}\n`);
                 }
             });
 
             proc.on("close", (code) => {
-                process.stdout.write("\n");
+                if (!onProgress) process.stdout.write("\n");
                 if (code === 0) {
                     resolve();
                     return;
@@ -323,10 +375,17 @@ class SoopVodDownloader {
     // ── 메인 플로우 ───────────────────────────
 
     private async runDownloadFlow(): Promise<void> {
-        const userId = await this.ask("\n스트리머 아이디 입력: ");
+        const lastId = this.settings.lastUserId;
+        const prompt = lastId ? `\n스트리머 아이디 입력 (엔터 = ${lastId}): ` : "\n스트리머 아이디 입력: ";
+        const input = await this.ask(prompt);
+        const userId = input || lastId;
         if (!userId) {
             console.log("아이디를 입력해주세요.");
             return;
+        }
+        if (userId !== this.settings.lastUserId) {
+            this.settings.lastUserId = userId;
+            saveConfig(this.settings);
         }
 
         // 1) 전체 VOD 목록 수집
@@ -339,20 +398,37 @@ class SoopVodDownloader {
             `  ${vods.length}번 (가장 오래됨): ${vods[vods.length - 1].title}  [${vods[vods.length - 1].date}]`,
         );
 
-        // 2) 범위 입력 (두 번)
+        // 2) 범위 입력
+        const savedFrom = this.settings.lastFrom;
+        const savedTo = this.settings.lastTo ?? vods.length;
         console.log(`\n다운로드할 번호 범위를 입력하세요 (1 = 최신, ${vods.length} = 가장 오래됨)`);
         let from: number;
         let to: number;
 
         while (true) {
-            from = await this.askInt(`  시작 번호 (1 ~ ${vods.length}): `, 1, vods.length);
-            to = await this.askInt(`  끝   번호 (1 ~ ${vods.length}): `, 1, vods.length);
-
+            const rawFrom = await this.ask(`  시작 번호 (1 ~ ${vods.length}, 엔터 = ${savedFrom}): `);
+            from = rawFrom ? parseInt(rawFrom, 10) : savedFrom;
+            if (isNaN(from) || from < 1 || from > vods.length) {
+                console.log(`  ⚠  1 ~ ${vods.length} 사이의 숫자를 입력해주세요.`);
+                continue;
+            }
+            const rawTo = await this.ask(`  끝   번호 (1 ~ ${vods.length}, 엔터 = ${savedTo}): `);
+            to = rawTo ? parseInt(rawTo, 10) : savedTo;
+            if (isNaN(to) || to < 1 || to > vods.length) {
+                console.log(`  ⚠  1 ~ ${vods.length} 사이의 숫자를 입력해주세요.`);
+                continue;
+            }
             if (from > to) {
                 console.log("  ⚠  시작 번호가 끝 번호보다 큽니다. 다시 입력해주세요.");
                 continue;
             }
             break;
+        }
+
+        if (from !== this.settings.lastFrom || to !== this.settings.lastTo) {
+            this.settings.lastFrom = from;
+            this.settings.lastTo = to;
+            saveConfig(this.settings);
         }
 
         // 3) 선택한 범위 미리보기
@@ -377,7 +453,7 @@ class SoopVodDownloader {
         }
 
         // 5) 출력 폴더 선택
-        const defaultOutputDir = path.join(process.cwd(), "downloads", userId);
+        const defaultOutputDir = this.settings.lastOutputDir || path.join(process.cwd(), "downloads", userId);
         console.log(`\n기본 저장 경로: ${defaultOutputDir}`);
         console.log(`  1) 기본값 사용`);
         console.log(`  2) 폴더 찾아보기 창 열기`);
@@ -396,28 +472,32 @@ class SoopVodDownloader {
             outputDir = defaultOutputDir;
         }
 
+        if (outputDir !== this.settings.lastOutputDir) {
+            this.settings.lastOutputDir = outputDir;
+            saveConfig(this.settings);
+        }
+
         fs.mkdirSync(outputDir, { recursive: true });
         console.log(`\n저장 경로: ${outputDir}`);
         console.log(`yt-dlp  : ${this.resolveYtDlpPath()}`);
         const ffmpegPath = this.resolveFfmpegPath();
         console.log(`ffmpeg  : ${ffmpegPath ?? "(PATH에서 자동 탐색)"}\n`);
 
-        // 6) 다운로드 방식 선택
-        console.log(`\n다운로드 방식을 선택하세요:`);
-        console.log(`  1) 순차 (1개씩 차례대로)`);
-        console.log(`  2) 병렬 (여러 개 동시)`);
-        const modeChoice = await this.askInt(`선택 (1~2): `, 1, 2);
-
-        let concurrency = 1;
-        if (modeChoice === 2) {
-            const raw = await this.ask(`동시 다운로드 수 (엔터 = 기본값 3): `);
-            const parsed = parseInt(raw, 10);
-            concurrency = !isNaN(parsed) && parsed >= 1 ? parsed : 3;
-        }
+        // 6) 다운로드 실행
+        const concurrency = this.settings.concurrency;
+        const modeLabel = concurrency <= 1 ? "순차" : `병렬 ${concurrency}개`;
+        console.log(`\n다운로드 는 [${modeLabel}] 모드로 실행됩니다. (설정에서 변경 가능)\n`);
 
         const selected = vods.slice(from - 1, to);
         let successCount = 0;
         let failCount = 0;
+
+        // 속도 제한: --limit-rate 는 fragment(연결) 1개당 제한
+        // → 총 속도 ÷ 동시 VOD 수 ÷ concurrent-fragments(4) 로 계산
+        const CONCURRENT_FRAGMENTS = 4;
+        const totalSpeedMB = this.settings.speedLimitMB;
+        const perSpeedMB =
+            totalSpeedMB !== null ? Math.max(0.1, totalSpeedMB / concurrency / CONCURRENT_FRAGMENTS) : null;
 
         if (concurrency <= 1) {
             // 순차
@@ -426,7 +506,7 @@ class SoopVodDownloader {
                 console.log(`[${i + 1}/${selected.length}] #${vod.index}: ${vod.title}`);
                 console.log(`  URL: ${vod.url}`);
                 try {
-                    await this.downloadOne(vod, outputDir);
+                    await this.downloadOne(vod, outputDir, perSpeedMB);
                     console.log("  ✓ 완료\n");
                     successCount++;
                 } catch (err: unknown) {
@@ -437,31 +517,65 @@ class SoopVodDownloader {
             }
         } else {
             // 병렬 (concurrency 개씩 묶어서 처리)
-            console.log(`병렬 다운로드 시작 (동시 ${concurrency}개)\n`);
-            for (let i = 0; i < selected.length; i += concurrency) {
-                const batch = selected.slice(i, i + concurrency);
-                const results = await Promise.allSettled(
-                    batch.map((vod, j) => {
-                        const globalIdx = i + j + 1;
-                        console.log(`[${globalIdx}/${selected.length}] #${vod.index}: ${vod.title}`);
-                        console.log(`  URL: ${vod.url}`);
-                        return this.downloadOne(vod, outputDir);
-                    }),
-                );
-                for (let j = 0; j < results.length; j++) {
-                    const vod = batch[j];
-                    if (results[j].status === "fulfilled") {
-                        console.log(`  ✓ [#${vod.index}] 완료`);
+            const speedNote =
+                totalSpeedMB !== null
+                    ? ` / 속도: 총 ${totalSpeedMB} MB/s → 개당 ${Math.round((perSpeedMB ?? 0) * 10) / 10} MB/s`
+                    : "";
+            console.log(`병렬 다운로드 시작 (동시 ${concurrency}개${speedNote})\n`);
+
+            const W = 78;
+            const total = selected.length;
+            let nextIdx = 0; // JS 단일 스레드: race condition 없음
+
+            // 슬롯별 상태 라인
+            const statusLines: string[] = Array.from({ length: concurrency }, (_, s) => `[슬롯 ${s + 1}] 대기 중...`);
+
+            // 초기 라인 출력
+            for (const line of statusLines) {
+                process.stdout.write(line.substring(0, W).padEnd(W) + "\n");
+            }
+
+            const render = () => {
+                process.stdout.write(`\x1b[${concurrency}A`);
+                for (const line of statusLines) {
+                    process.stdout.write(`\r${line.substring(0, W).padEnd(W)}\n`);
+                }
+            };
+
+            const renderInterval = setInterval(render, 150);
+
+            // 슬롯 워커: 큐가 빌 때까지 계속 꺼내서 다운
+            const runSlot = async (slot: number): Promise<void> => {
+                while (nextIdx < total) {
+                    const idx = nextIdx++;
+                    const vod = selected[idx];
+                    const globalIdx = idx + 1;
+                    const prefix = `[${globalIdx}/${total}] #${vod.index}`;
+                    const title = vod.title.substring(0, 25);
+                    statusLines[slot] = `${prefix} ${title}  다운로드 중...`;
+                    try {
+                        await this.downloadOne(vod, outputDir, perSpeedMB, (progressLine) => {
+                            const info = progressLine
+                                .replace(/^\[download\]\s*/, "")
+                                .replace(/\(frag.*?\)/, "")
+                                .trim();
+                            statusLines[slot] = `${prefix} ${title}  ${info}`;
+                        });
+                        statusLines[slot] = `${prefix} ${title}  ✓ 완료`;
                         successCount++;
-                    } else {
-                        const reason = (results[j] as PromiseRejectedResult).reason as Error;
-                        console.error(`  ✗ [#${vod.index}] 실패: ${reason.message}`);
+                    } catch (err: unknown) {
+                        statusLines[slot] = `${prefix} ${title}  ✗ 실패: ${(err as Error).message.substring(0, 30)}`;
                         failCount++;
                     }
                 }
-                console.log();
-                if (i + concurrency < selected.length) await delay(500);
-            }
+                statusLines[slot] = `[슬롯 ${slot + 1}] 완료`;
+            };
+
+            await Promise.all(Array.from({ length: concurrency }, (_, slot) => runSlot(slot)));
+
+            clearInterval(renderInterval);
+            render();
+            console.log();
         }
 
         // 7) 결과 요약
@@ -472,12 +586,64 @@ class SoopVodDownloader {
         console.log(sep + "\n");
     }
 
+    // ── 설정 ──────────────────────────────────
+
+    private async runSettingsFlow(): Promise<void> {
+        while (true) {
+            const speedLabel = this.settings.speedLimitMB !== null ? `${this.settings.speedLimitMB} MB/s` : `무제한`;
+            const concLabel = this.settings.concurrency <= 1 ? `순차` : `병렬 ${this.settings.concurrency}개`;
+            console.log(`\n[ 설 정 ]`);
+            console.log(`  1. 다운로드 속도 제한  (현재: ${speedLabel})`);
+            console.log(`  2. 다운로드 방식      (현재: ${concLabel})`);
+            console.log(`  0. 뒤로`);
+
+            const choice = await this.ask("\n선택 > ");
+
+            if (choice === "0") {
+                break;
+            } else if (choice === "1") {
+                console.log(`\n속도 제한 설정 (단위: MB/s)`);
+                console.log(`  예) 50  → 50 MB/s 로 제한`);
+                console.log(`  예) 0   → 무제한`);
+                const raw = await this.ask(`속도 입력 (현재: ${speedLabel}): `);
+                const val = parseFloat(raw);
+                if (!isNaN(val) && val >= 0) {
+                    this.settings.speedLimitMB = val === 0 ? null : val;
+                    saveConfig(this.settings);
+                    const label = this.settings.speedLimitMB !== null ? `${this.settings.speedLimitMB} MB/s` : `무제한`;
+                    console.log(`  ✓ 속도 제한이 [${label}] 으로 설정되었습니다.\n`);
+                } else {
+                    console.log(`  ⚠  올바른 숫자를 입력해주세요.\n`);
+                }
+            } else if (choice === "2") {
+                console.log(`\n다운로드 방식 설정`);
+                console.log(`  예) 1  → 순차 (1개씩)`);
+                console.log(`  예) 3  → 병렬 3개 동시`);
+                const raw = await this.ask(`동시 수 입력 (현재: ${concLabel}): `);
+                const val = parseInt(raw, 10);
+                if (!isNaN(val) && val >= 1) {
+                    this.settings.concurrency = val;
+                    saveConfig(this.settings);
+                    const label = val <= 1 ? `순차` : `병렬 ${val}개`;
+                    console.log(`  ✓ 다운로드 방식이 [${label}] 으로 설정되었습니다.\n`);
+                } else {
+                    console.log(`  ⚠  1 이상의 숫자를 입력해주세요.\n`);
+                }
+            } else {
+                console.log("올바른 번호를 입력해주세요.\n");
+            }
+        }
+    }
+
     // ── 루프 진입점 ───────────────────────────
 
     async run(): Promise<void> {
         while (true) {
+            const speedLabel = this.settings.speedLimitMB !== null ? `${this.settings.speedLimitMB} MB/s` : `무제한`;
+            const concLabel = this.settings.concurrency <= 1 ? `순차` : `병렬 ${this.settings.concurrency}개`;
             console.log("[ 메 뉴 ]");
             console.log("  1. VOD 검색 및 다운로드");
+            console.log(`  2. 설정  (속도: ${speedLabel} / 방식: ${concLabel})`);
             console.log("  0. 종료");
 
             const choice = await this.ask("\n선택 > ");
@@ -487,6 +653,8 @@ class SoopVodDownloader {
                 break;
             } else if (choice === "1") {
                 await this.runDownloadFlow();
+            } else if (choice === "2") {
+                await this.runSettingsFlow();
             } else {
                 console.log("올바른 번호를 입력해주세요.\n");
             }
