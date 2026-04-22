@@ -217,6 +217,28 @@ class SoopVodDownloader {
         }
     }
 
+    private openFolderDialog(defaultPath: string): string | null {
+        try {
+            const ps = [
+                `Add-Type -AssemblyName System.Windows.Forms;`,
+                `$d = New-Object System.Windows.Forms.FolderBrowserDialog;`,
+                `$d.Description = '저장 폴더를 선택하세요';`,
+                `$d.ShowNewFolderButton = $true;`,
+                `$d.SelectedPath = '${defaultPath.replace(/'/g, "''")}';`,
+                `$r = $d.ShowDialog();`,
+                `if ($r -eq 'OK') { $d.SelectedPath } else { '' }`,
+            ].join(" ");
+            const result = execSync(`powershell -NoProfile -Command "${ps}"`, {
+                stdio: ["pipe", "pipe", "pipe"],
+                encoding: "utf8",
+            }).trim();
+            return result || null;
+        } catch {
+            console.log(`  ⚠  폴더 선택창을 열 수 없습니다. 직접 경로를 입력해주세요.`);
+            return null;
+        }
+    }
+
     private downloadOne(vod: VodItem, outputDir: string): Promise<void> {
         return new Promise((resolve, reject) => {
             const safeName = sanitizeFilename(vod.title);
@@ -357,35 +379,88 @@ class SoopVodDownloader {
         // 5) 출력 폴더 선택
         const defaultOutputDir = path.join(process.cwd(), "downloads", userId);
         console.log(`\n기본 저장 경로: ${defaultOutputDir}`);
-        const inputDir = await this.ask(`저장 경로 입력 (엔터 = 기본값 사용): `);
-        const outputDir = inputDir ? path.resolve(inputDir.trim()) : defaultOutputDir;
+        console.log(`  1) 기본값 사용`);
+        console.log(`  2) 폴더 찾아보기 창 열기`);
+        console.log(`  3) 직접 경로 입력`);
+        const pathChoice = await this.askInt(`선택 (1~3): `, 1, 3);
+
+        let outputDir: string;
+        if (pathChoice === 2) {
+            const picked = this.openFolderDialog(defaultOutputDir);
+            outputDir = picked ?? defaultOutputDir;
+            if (!picked) console.log(`  (선택 취소됨 — 기본 경로 사용)`);
+        } else if (pathChoice === 3) {
+            const inputDir = await this.ask(`저장 경로 입력: `);
+            outputDir = inputDir.trim() ? path.resolve(inputDir.trim()) : defaultOutputDir;
+        } else {
+            outputDir = defaultOutputDir;
+        }
+
         fs.mkdirSync(outputDir, { recursive: true });
         console.log(`\n저장 경로: ${outputDir}`);
         console.log(`yt-dlp  : ${this.resolveYtDlpPath()}`);
         const ffmpegPath = this.resolveFfmpegPath();
         console.log(`ffmpeg  : ${ffmpegPath ?? "(PATH에서 자동 탐색)"}\n`);
 
-        // 6) 순차 다운로드
+        // 6) 다운로드 방식 선택
+        console.log(`\n다운로드 방식을 선택하세요:`);
+        console.log(`  1) 순차 (1개씩 차례대로)`);
+        console.log(`  2) 병렬 (여러 개 동시)`);
+        const modeChoice = await this.askInt(`선택 (1~2): `, 1, 2);
+
+        let concurrency = 1;
+        if (modeChoice === 2) {
+            const raw = await this.ask(`동시 다운로드 수 (엔터 = 기본값 3): `);
+            const parsed = parseInt(raw, 10);
+            concurrency = !isNaN(parsed) && parsed >= 1 ? parsed : 3;
+        }
+
         const selected = vods.slice(from - 1, to);
         let successCount = 0;
         let failCount = 0;
 
-        for (let i = 0; i < selected.length; i++) {
-            const vod = selected[i];
-            console.log(`[${i + 1}/${selected.length}] #${vod.index}: ${vod.title}`);
-            console.log(`  URL: ${vod.url}`);
-
-            try {
-                await this.downloadOne(vod, outputDir);
-                console.log("  ✓ 완료\n");
-                successCount++;
-            } catch (err: unknown) {
-                console.error(`  ✗ 실패: ${(err as Error).message}\n`);
-                failCount++;
+        if (concurrency <= 1) {
+            // 순차
+            for (let i = 0; i < selected.length; i++) {
+                const vod = selected[i];
+                console.log(`[${i + 1}/${selected.length}] #${vod.index}: ${vod.title}`);
+                console.log(`  URL: ${vod.url}`);
+                try {
+                    await this.downloadOne(vod, outputDir);
+                    console.log("  ✓ 완료\n");
+                    successCount++;
+                } catch (err: unknown) {
+                    console.error(`  ✗ 실패: ${(err as Error).message}\n`);
+                    failCount++;
+                }
+                if (i < selected.length - 1) await delay(500);
             }
-
-            if (i < selected.length - 1) {
-                await delay(500);
+        } else {
+            // 병렬 (concurrency 개씩 묶어서 처리)
+            console.log(`병렬 다운로드 시작 (동시 ${concurrency}개)\n`);
+            for (let i = 0; i < selected.length; i += concurrency) {
+                const batch = selected.slice(i, i + concurrency);
+                const results = await Promise.allSettled(
+                    batch.map((vod, j) => {
+                        const globalIdx = i + j + 1;
+                        console.log(`[${globalIdx}/${selected.length}] #${vod.index}: ${vod.title}`);
+                        console.log(`  URL: ${vod.url}`);
+                        return this.downloadOne(vod, outputDir);
+                    }),
+                );
+                for (let j = 0; j < results.length; j++) {
+                    const vod = batch[j];
+                    if (results[j].status === "fulfilled") {
+                        console.log(`  ✓ [#${vod.index}] 완료`);
+                        successCount++;
+                    } else {
+                        const reason = (results[j] as PromiseRejectedResult).reason as Error;
+                        console.error(`  ✗ [#${vod.index}] 실패: ${reason.message}`);
+                        failCount++;
+                    }
+                }
+                console.log();
+                if (i + concurrency < selected.length) await delay(500);
             }
         }
 
