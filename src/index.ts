@@ -315,12 +315,15 @@ class SoopVodDownloader {
             const proc = spawn(ytDlpPath, args, { stdio: ["ignore", "pipe", "pipe"] });
 
             proc.stdout.on("data", (chunk: Buffer) => {
-                const line = chunk.toString().replace(/\r?\n$/, "");
-                if (line.includes("[download]") || line.includes("%")) {
-                    if (onProgress) {
-                        onProgress(line);
-                    } else {
-                        process.stdout.write(`\r    ${line.substring(0, 72).padEnd(72)}`);
+                for (const rawLine of chunk.toString().split(/\r?\n/)) {
+                    const line = rawLine.trim();
+                    // [download] X% 형식만 통과, [hlsnative] 등 나머지 무시
+                    if (line.startsWith("[download]") && line.includes("%")) {
+                        if (onProgress) {
+                            onProgress(line);
+                        } else {
+                            process.stdout.write(`\r    ${line.substring(0, 72).padEnd(72)}`);
+                        }
                     }
                 }
             });
@@ -483,98 +486,87 @@ class SoopVodDownloader {
         const ffmpegPath = this.resolveFfmpegPath();
         console.log(`ffmpeg  : ${ffmpegPath ?? "(PATH에서 자동 탐색)"}\n`);
 
-        // 6) 다운로드 실행
+        // 6) 다운로드 실행 (순차/병렬 통합 대시보드)
         const concurrency = this.settings.concurrency;
-        const modeLabel = concurrency <= 1 ? "순차" : `병렬 ${concurrency}개`;
-        console.log(`\n다운로드 는 [${modeLabel}] 모드로 실행됩니다. (설정에서 변경 가능)\n`);
-
         const selected = vods.slice(from - 1, to);
         let successCount = 0;
         let failCount = 0;
 
-        // 속도 제한: --limit-rate 는 fragment(연결) 1개당 제한
-        // → 총 속도 ÷ 동시 VOD 수 ÷ concurrent-fragments(4) 로 계산
         const CONCURRENT_FRAGMENTS = 4;
         const totalSpeedMB = this.settings.speedLimitMB;
         const perSpeedMB =
             totalSpeedMB !== null ? Math.max(0.1, totalSpeedMB / concurrency / CONCURRENT_FRAGMENTS) : null;
 
-        if (concurrency <= 1) {
-            // 순차
-            for (let i = 0; i < selected.length; i++) {
-                const vod = selected[i];
-                console.log(`[${i + 1}/${selected.length}] #${vod.index}: ${vod.title}`);
-                console.log(`  URL: ${vod.url}`);
-                try {
-                    await this.downloadOne(vod, outputDir, perSpeedMB);
-                    console.log("  ✓ 완료\n");
-                    successCount++;
-                } catch (err: unknown) {
-                    console.error(`  ✗ 실패: ${(err as Error).message}\n`);
-                    failCount++;
-                }
-                if (i < selected.length - 1) await delay(500);
-            }
-        } else {
-            // 병렬 (concurrency 개씩 묶어서 처리)
-            const speedNote =
-                totalSpeedMB !== null
-                    ? ` / 속도: 총 ${totalSpeedMB} MB/s → 개당 ${Math.round((perSpeedMB ?? 0) * 10) / 10} MB/s`
-                    : "";
-            console.log(`병렬 다운로드 시작 (동시 ${concurrency}개${speedNote})\n`);
-
-            const W = 78;
+        {
             const total = selected.length;
-            let nextIdx = 0; // JS 단일 스레드: race condition 없음
+            const NUM_W = String(total).length;
+            const TITLE_W = 26;
+            const LABEL_W = NUM_W * 2 + 3 + 1 + TITLE_W; // [NNN/NNN] + space + title
+            const W = Math.max(80, process.stdout.columns ?? 80);
+            const DASH_LINES = concurrency + 2; // 헤더 + 구분선 + 슬롯
+            let nextIdx = 0;
 
-            // 슬롯별 상태 라인
-            const statusLines: string[] = Array.from({ length: concurrency }, (_, s) => `[슬롯 ${s + 1}] 대기 중...`);
+            const slotLabel: string[] = Array.from({ length: concurrency }, (_, s) => `[슬롯 ${s + 1}]`);
+            const slotProgress: string[] = Array.from({ length: concurrency }, () => "대기 중...");
 
-            // 초기 라인 출력
-            for (const line of statusLines) {
-                process.stdout.write(line.substring(0, W).padEnd(W) + "\n");
-            }
+            const parseProgress = (line: string): string => {
+                const m = line.match(/(\d+\.?\d*)%\s+of\s+~?\s*([\d.]+\s*\S+)\s+at\s+([\d.]+\s*\S+\/s)\s+ETA\s+(\S+)/);
+                if (m) {
+                    const pct = `${parseFloat(m[1]).toFixed(1)}%`.padStart(6);
+                    const size = `~${m[2].replace(/\s+/g, "")}`.substring(0, 10).padEnd(10);
+                    const speed = m[3].replace(/\s+/g, "").substring(0, 12).padEnd(12);
+                    return `${pct}  ${size}  ${speed}  ETA ${m[4]}`;
+                }
+                return line
+                    .replace(/^\[download\]\s*/, "")
+                    .replace(/\(frag[^)]*\)/, "")
+                    .trim()
+                    .substring(0, 45);
+            };
 
-            const render = () => {
-                process.stdout.write(`\x1b[${concurrency}A`);
-                for (const line of statusLines) {
+            const printDashboard = (moveUp: boolean): void => {
+                const done = successCount + failCount;
+                const speedNote = totalSpeedMB !== null ? `  속도: ${totalSpeedMB} MB/s` : "";
+                const modeNote = concurrency <= 1 ? "순차" : `병렬 ${concurrency}개`;
+                const header = `다운로드 [${modeNote}]  ${done}/${total} 완료  성공: ${successCount}  실패: ${failCount}${speedNote}`;
+                if (moveUp) process.stdout.write(`\x1b[${DASH_LINES}A`);
+                process.stdout.write(`\r${header.substring(0, W).padEnd(W)}\n`);
+                process.stdout.write(`\r${"─".repeat(W)}\n`);
+                for (let s = 0; s < concurrency; s++) {
+                    const line = `${slotLabel[s].substring(0, LABEL_W).padEnd(LABEL_W)}  ${slotProgress[s]}`;
                     process.stdout.write(`\r${line.substring(0, W).padEnd(W)}\n`);
                 }
             };
 
-            const renderInterval = setInterval(render, 150);
+            console.log();
+            printDashboard(false);
+            const renderInterval = setInterval(() => printDashboard(true), 150);
 
-            // 슬롯 워커: 큐가 빌 때까지 계속 꺼내서 다운
             const runSlot = async (slot: number): Promise<void> => {
                 while (nextIdx < total) {
                     const idx = nextIdx++;
                     const vod = selected[idx];
-                    const globalIdx = idx + 1;
-                    const prefix = `[${globalIdx}/${total}] #${vod.index}`;
-                    const title = vod.title.substring(0, 25);
-                    statusLines[slot] = `${prefix} ${title}  다운로드 중...`;
+                    const numStr = `[${String(idx + 1).padStart(NUM_W)}/${total}]`;
+                    slotLabel[slot] = `${numStr} ${vod.title.substring(0, TITLE_W)}`;
+                    slotProgress[slot] = "연결 중...";
                     try {
                         await this.downloadOne(vod, outputDir, perSpeedMB, (progressLine) => {
-                            const info = progressLine
-                                .replace(/^\[download\]\s*/, "")
-                                .replace(/\(frag.*?\)/, "")
-                                .trim();
-                            statusLines[slot] = `${prefix} ${title}  ${info}`;
+                            slotProgress[slot] = parseProgress(progressLine);
                         });
-                        statusLines[slot] = `${prefix} ${title}  ✓ 완료`;
+                        slotProgress[slot] = "✓ 완료";
                         successCount++;
                     } catch (err: unknown) {
-                        statusLines[slot] = `${prefix} ${title}  ✗ 실패: ${(err as Error).message.substring(0, 30)}`;
+                        slotProgress[slot] = `✗ 실패: ${(err as Error).message.substring(0, 20)}`;
                         failCount++;
                     }
                 }
-                statusLines[slot] = `[슬롯 ${slot + 1}] 완료`;
+                slotLabel[slot] = `[슬롯 ${slot + 1}]`;
+                slotProgress[slot] = "완료";
             };
 
             await Promise.all(Array.from({ length: concurrency }, (_, slot) => runSlot(slot)));
-
             clearInterval(renderInterval);
-            render();
+            printDashboard(true);
             console.log();
         }
 
