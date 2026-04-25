@@ -1,8 +1,8 @@
 {
   "speedLimitMB": 60,
-  "concurrency": 5,
+  "concurrency": 3,
   "lastUserId": "nanajam",
-  "lastOutputDir": "C:\\Users\\bcong\\Desktop\\nanajam",
+  "lastOutputDir": "G:\\nanajam",
   "lastFrom": 1,
-  "lastTo": 1
+  "lastTo": 100
 }
