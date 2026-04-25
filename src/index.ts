@@ -289,9 +289,26 @@ class SoopVodDownloader {
     ): Promise<void> {
         return new Promise((resolve, reject) => {
             const safeName = sanitizeFilename(vod.title);
-            const outTemplate = path.join(outputDir, `${safeName}.%(ext)s`);
-            // 완료 후 파일 존재 확인용 경로 (항상 mp4)
-            const expectedFile = path.join(outputDir, `${safeName}.mp4`);
+            // 임시 다운로드 폴더 (_temp) — .part / 세그먼트 파일이 여기에 쌓임
+            const tempDir = path.join(outputDir, "_temp");
+            fs.mkdirSync(tempDir, { recursive: true });
+            // 다운로드 중에는 앞에 VOD 번호 접두사 붙임
+            const tempBase = `[${vod.index}] ${safeName}`;
+            const outTemplate = path.join(tempDir, `${tempBase}.%(ext)s`);
+            // 완료 후 파일 경로
+            const tempFile = path.join(tempDir, `${tempBase}.mp4`);
+            const finalFile = path.join(outputDir, `${safeName}.mp4`);
+
+            // ① 최종 파일이 이미 존재하면 건너뜀
+            if (fs.existsSync(finalFile) && fs.statSync(finalFile).size > 0) {
+                if (onProgress) {
+                    onProgress("__skipped__");
+                } else {
+                    process.stdout.write(`    건너뜀 (이미 존재): ${safeName}\n`);
+                }
+                resolve();
+                return;
+            }
 
             const ffmpegPath = this.resolveFfmpegPath();
 
@@ -337,13 +354,24 @@ class SoopVodDownloader {
 
             proc.on("close", (code) => {
                 if (!onProgress) process.stdout.write("\n");
+
+                // 다운로드 완료 후 임시 접두사 파일 → 최종 파일명으로 리네임
+                const tryRename = (): boolean => {
+                    if (fs.existsSync(tempFile) && fs.statSync(tempFile).size > 0) {
+                        fs.renameSync(tempFile, finalFile);
+                        return true;
+                    }
+                    return false;
+                };
+
                 if (code === 0) {
+                    tryRename();
                     resolve();
                     return;
                 }
                 // exit code != 0 이어도 파일이 생성됐으면 성공으로 간주
                 // (ffprobe 미설치 등 메타데이터 관련 오류는 파일 자체에 영향 없음)
-                if (fs.existsSync(expectedFile) && fs.statSync(expectedFile).size > 0) {
+                if (tryRename()) {
                     resolve();
                     return;
                 }
@@ -488,6 +516,7 @@ class SoopVodDownloader {
         const selected = vods.slice(from - 1, to);
         let successCount = 0;
         let failCount = 0;
+        let skipCount = 0;
 
         const CONCURRENT_FRAGMENTS = 4;
         const totalSpeedMB = this.settings.speedLimitMB;
@@ -525,11 +554,21 @@ class SoopVodDownloader {
                     slotNo[slot] = String(idx + 1);
                     slotPct[slot] = "0%";
                     try {
+                        let skipped = false;
                         await this.downloadOne(vod, outputDir, perSpeedMB, (progressLine) => {
+                            if (progressLine === "__skipped__") {
+                                skipped = true;
+                                return;
+                            }
                             slotPct[slot] = parsePct(progressLine);
                         });
-                        slotPct[slot] = "완료";
-                        successCount++;
+                        if (skipped) {
+                            slotPct[slot] = "건너뜀";
+                            skipCount++;
+                        } else {
+                            slotPct[slot] = "완료";
+                            successCount++;
+                        }
                     } catch (err: unknown) {
                         slotPct[slot] = "실패";
                         failCount++;
@@ -548,7 +587,7 @@ class SoopVodDownloader {
         // 7) 결과 요약
         const sep = "═".repeat(44);
         console.log(sep);
-        console.log(`다운로드 완료  성공: ${successCount}개  /  실패: ${failCount}개`);
+        console.log(`다운로드 완료  성공: ${successCount}개  /  건너뜀: ${skipCount}개  /  실패: ${failCount}개`);
         console.log(`저장 위치: ${outputDir}`);
         console.log(sep + "\n");
     }

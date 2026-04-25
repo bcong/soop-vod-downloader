@@ -1,6 +1,6 @@
 {
   "speedLimitMB": 60,
-  "concurrency": 3,
+  "concurrency": 1,
   "lastUserId": "nanajam",
   "lastOutputDir": "G:\\nanajam",
   "lastFrom": 1,
