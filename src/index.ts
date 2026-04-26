@@ -14,6 +14,7 @@ interface VodItem {
     title: string;
     date: string;
     duration: string;
+    fileSize: number; // bytes (0 = 알 수 없음)
     viewCount: number;
     url: string;
 }
@@ -24,6 +25,13 @@ interface VodItem {
 
 function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatFileSize(bytes: number): string {
+    if (bytes <= 0) return "-";
+    if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GB`;
+    if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(0)}MB`;
+    return `${(bytes / 1024).toFixed(0)}KB`;
 }
 
 function sanitizeFilename(name: string, maxLen = 80): string {
@@ -53,7 +61,7 @@ interface VodApiItem {
     title_name: string;
     user_id: string;
     reg_date: string;
-    ucc?: { total_file_duration?: number };
+    ucc?: { total_file_duration?: number; total_file_size?: number };
     count?: { read_cnt?: number };
 }
 
@@ -205,6 +213,7 @@ class SoopVodDownloader {
                     title: item.title_name,
                     date: item.reg_date.substring(0, 10),
                     duration: formatDuration(Math.floor(durationMs / 1000)),
+                    fileSize: item.ucc?.total_file_size ?? 0,
                     viewCount: item.count?.read_cnt ?? 0,
                     url: `https://vod.sooplive.co.kr/player/${item.title_no}`,
                 });
@@ -259,6 +268,19 @@ class SoopVodDownloader {
         }
     }
 
+    /** 지정 경로 드라이브의 여유 공간(GB)을 반환. 확인 불가 시 Infinity */
+    private getAvailableDiskSpaceGB(dir: string): number {
+        try {
+            // Node.js 18.15+ 에서 제공하는 fs.statfsSync 사용
+            const stats = (
+                fs as unknown as { statfsSync: (p: string) => { bsize: number; bavail: number } }
+            ).statfsSync(dir);
+            return (stats.bavail * stats.bsize) / (1024 * 1024 * 1024);
+        } catch {
+            return Infinity;
+        }
+    }
+
     private openFolderDialog(defaultPath: string): string | null {
         try {
             const ps = [
@@ -281,126 +303,282 @@ class SoopVodDownloader {
         }
     }
 
-    private downloadOne(
-        vod: VodItem,
-        outputDir: string,
-        speedLimitMB: number | null = null,
-        onProgress?: (line: string) => void,
-    ): Promise<void> {
-        return new Promise((resolve, reject) => {
-            const safeName = sanitizeFilename(vod.title);
-            // 임시 다운로드 폴더 (_temp) — .part / 세그먼트 파일이 여기에 쌓임
-            const tempDir = path.join(outputDir, "_temp");
-            fs.mkdirSync(tempDir, { recursive: true });
-            // 다운로드 중에는 앞에 VOD 번호 접두사 붙임
-            const tempBase = `[${vod.index}] ${safeName}`;
-            const outTemplate = path.join(tempDir, `${tempBase}.%(ext)s`);
-            // 완료 후 파일 경로
-            const tempFile = path.join(tempDir, `${tempBase}.mp4`);
-            const finalFile = path.join(outputDir, `${safeName}.mp4`);
-
-            // ① 최종 파일이 이미 존재하면 건너뜀
-            if (fs.existsSync(finalFile) && fs.statSync(finalFile).size > 0) {
-                if (onProgress) {
-                    onProgress("__skipped__");
-                } else {
-                    process.stdout.write(`    건너뜀 (이미 존재): ${safeName}\n`);
-                }
-                resolve();
-                return;
+    /** SOOP API에서 VOD의 실제 파일 URL 목록을 가져옴 (멀티파트 지원) */
+    private async getVodFileUrls(titleNo: number, vodUrl: string): Promise<string[]> {
+        try {
+            const resp = await this.http.post(
+                "https://api.m.sooplive.co.kr/station/video/a/view",
+                `nTitleNo=${titleNo}&nApiLevel=10`,
+                {
+                    headers: {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        Referer: vodUrl,
+                    },
+                },
+            );
+            const files = resp.data?.data?.files;
+            if (Array.isArray(files) && files.length > 0) {
+                return (files as { file?: string }[]).map((f) => f.file ?? "").filter(Boolean);
             }
+        } catch {
+            // API 실패 시 빈 배열 → 기본 방식으로 폴백
+        }
+        return [];
+    }
 
-            const ffmpegPath = this.resolveFfmpegPath();
-
-            const args = [
-                vod.url,
-                "-o",
-                outTemplate,
-                "--no-playlist",
-                "--progress",
-                "--no-warnings",
-                "--newline", // 진행률을 줄바꿈 단위로 출력
-                "--merge-output-format",
-                "mp4", // 세그먼트/스트림 병합 후 단일 mp4
-                "--concurrent-fragments",
-                "4", // HLS 세그먼트 병렬 다운로드
-                ...(speedLimitMB !== null ? ["--limit-rate", `${speedLimitMB}M`] : []),
-                ...(ffmpegPath ? ["--ffmpeg-location", ffmpegPath] : []),
-            ];
-
+    /** yt-dlp 단일 실행 — args 에 URL/출력 경로 포함 */
+    private runYtDlp(args: string[], onProgress?: (line: string) => void): Promise<void> {
+        return new Promise((resolve, reject) => {
             const ytDlpPath = this.resolveYtDlpPath();
             const proc = spawn(ytDlpPath, args, { stdio: ["ignore", "pipe", "pipe"] });
 
             proc.stdout.on("data", (chunk: Buffer) => {
                 for (const rawLine of chunk.toString().split(/\r?\n/)) {
                     const line = rawLine.trim();
-                    // [download] X% 형식만 통과, [hlsnative] 등 나머지 무시
                     if (line.startsWith("[download]") && line.includes("%")) {
-                        if (onProgress) {
-                            onProgress(line);
-                        } else {
-                            process.stdout.write(`\r    ${line.substring(0, 72).padEnd(72)}`);
-                        }
+                        if (onProgress) onProgress(line);
+                        else process.stdout.write(`\r    ${line.substring(0, 72).padEnd(72)}`);
                     }
                 }
             });
 
             proc.stderr.on("data", (chunk: Buffer) => {
-                const line = chunk.toString().trim();
-                if (line && !line.startsWith("WARNING") && !line.startsWith("[debug]")) {
-                    if (!onProgress) process.stderr.write(`\n    [경고] ${line}\n`);
+                const txt = chunk.toString().trim();
+                if (txt && !txt.startsWith("WARNING") && !txt.startsWith("[debug]")) {
+                    if (!onProgress) process.stderr.write(`\n    [경고] ${txt}\n`);
                 }
             });
 
             proc.on("close", (code) => {
                 if (!onProgress) process.stdout.write("\n");
-
-                // 다운로드 완료 후 임시 접두사 파일 → 최종 파일명으로 리네임
-                const tryRename = (): boolean => {
-                    if (fs.existsSync(tempFile) && fs.statSync(tempFile).size > 0) {
-                        fs.renameSync(tempFile, finalFile);
-                        return true;
-                    }
-                    return false;
-                };
-
-                if (code === 0) {
-                    tryRename();
-                    resolve();
-                    return;
-                }
-                // exit code != 0 이어도 파일이 생성됐으면 성공으로 간주
-                // (ffprobe 미설치 등 메타데이터 관련 오류는 파일 자체에 영향 없음)
-                if (tryRename()) {
-                    resolve();
-                    return;
-                }
-                reject(new Error(`yt-dlp 종료 코드 ${code}`));
+                // exit code 가 0 이 아니어도 파일이 생성됐으면 호출자가 판단
+                if (code === 0) resolve();
+                else reject(new Error(`yt-dlp 종료 코드 ${code}`));
             });
 
+            proc.on("error", (err) => reject(new Error(`프로세스 실행 실패: ${err.message}`)));
+        });
+    }
+
+    /** ffmpeg concat demuxer 로 파트 파일들을 하나로 합침 */
+    private concatVideoParts(inputFiles: string[], outputFile: string, ffmpegPath: string | null): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const ffmpegCmd = ffmpegPath ?? "ffmpeg";
+            // 모든 파일이 같은 디렉터리에 있다고 가정
+            // 입·출력 모두 파일명(상대경로)만 사용 → 한글·특수문자 절대경로 파싱 오류 방지
+            const cwd = path.dirname(inputFiles[0]);
+            const outBasename = path.basename(outputFile);
+            const listFile = path.join(cwd, "_concat_list.txt");
+            const listContent = inputFiles.map((f) => `file '${path.basename(f)}'\n`).join("");
+            fs.writeFileSync(listFile, listContent, "utf8");
+
+            const proc = spawn(
+                ffmpegCmd,
+                ["-f", "concat", "-safe", "0", "-i", "_concat_list.txt", "-c", "copy", "-y", outBasename],
+                { stdio: ["ignore", "pipe", "pipe"], cwd },
+            );
+
+            proc.on("close", (code) => {
+                try {
+                    fs.rmSync(listFile);
+                } catch {
+                    /* 무시 */
+                }
+                if (code === 0) resolve();
+                else reject(new Error(`ffmpeg concat 실패 (종료 코드 ${code})`));
+            });
             proc.on("error", (err) => {
-                reject(new Error(`프로세스 실행 실패: ${err.message}`));
+                try {
+                    fs.rmSync(listFile);
+                } catch {
+                    /* 무시 */
+                }
+                reject(new Error(`ffmpeg 실행 실패: ${err.message}`));
             });
         });
+    }
+
+    private async downloadOne(
+        vod: VodItem,
+        outputDir: string,
+        speedLimitMB: number | null = null,
+        onProgress?: (line: string) => void,
+    ): Promise<void> {
+        const safeName = sanitizeFilename(vod.title);
+        const tempDir = path.join(outputDir, "_temp");
+        fs.mkdirSync(tempDir, { recursive: true });
+        const tempBase = `[${vod.index}] ${safeName}`;
+        const finalFile = path.join(outputDir, `${safeName}.mp4`);
+
+        const ffmpegPath = this.resolveFfmpegPath();
+
+        // 같은 인덱스 잔여 임시 파일 정리 (이전 실패 다운로드 잔여물 포함)
+        const cleanupTempFiles = (): void => {
+            try {
+                const prefix = `[${vod.index}]`;
+                for (const f of fs.readdirSync(tempDir)) {
+                    if (f.startsWith(prefix)) {
+                        try {
+                            fs.rmSync(path.join(tempDir, f));
+                        } catch {
+                            /* 무시 */
+                        }
+                    }
+                }
+                // concat 리스트 파일도 정리
+                const listFile = path.join(tempDir, "_concat_list.txt");
+                if (fs.existsSync(listFile)) {
+                    try {
+                        fs.rmSync(listFile);
+                    } catch {
+                        /* 무시 */
+                    }
+                }
+            } catch {
+                /* 무시 */
+            }
+        };
+
+        // ① 최종 파일이 이미 존재하면 잔여 임시파일 정리 후 건너뜀
+        if (fs.existsSync(finalFile) && fs.statSync(finalFile).size > 0) {
+            cleanupTempFiles();
+            if (onProgress) onProgress("__skipped__");
+            else process.stdout.write(`    건너뜀 (이미 존재): ${safeName}\n`);
+            return;
+        }
+
+        // 이전 실패 다운로드의 잔여 임시파일 선제 정리
+        cleanupTempFiles();
+
+        // ② SOOP API 에서 실제 m3u8 파일 URL 목록 조회
+        const fileUrls = await this.getVodFileUrls(vod.titleNo, vod.url);
+
+        if (fileUrls.length === 0) {
+            // API 실패 폴백: vod.url + --concat-playlist always (multi_video 처리)
+            const outTemplate = path.join(tempDir, `${tempBase}.%(ext)s`);
+            const tempFile = path.join(tempDir, `${tempBase}.mp4`);
+            const args = [
+                vod.url,
+                "-o",
+                outTemplate,
+                "--progress",
+                "--no-warnings",
+                "--newline",
+                "--merge-output-format",
+                "mp4",
+                "--concat-playlist",
+                "always",
+                "--concurrent-fragments",
+                "8",
+                ...(speedLimitMB !== null ? ["--limit-rate", `${speedLimitMB}M`] : []),
+                ...(ffmpegPath ? ["--ffmpeg-location", ffmpegPath] : []),
+            ];
+            try {
+                await this.runYtDlp(args, onProgress);
+            } catch {
+                /* 파일 있으면 계속 */
+            }
+            if (fs.existsSync(tempFile) && fs.statSync(tempFile).size > 0) {
+                fs.renameSync(tempFile, finalFile);
+                cleanupTempFiles();
+            }
+            return;
+        }
+
+        // ③ m3u8 URL 로 파트별 다운로드 → ffmpeg concat (파트 파일은 _temp 안에서만 존재)
+        const partFiles: string[] = [];
+        for (let i = 0; i < fileUrls.length; i++) {
+            const partBase = `${tempBase}_p${String(i + 1).padStart(2, "0")}`;
+            const partTemplate = path.join(tempDir, `${partBase}.%(ext)s`);
+            const partFile = path.join(tempDir, `${partBase}.mp4`);
+
+            if (fileUrls.length > 1) {
+                if (onProgress) onProgress(`__status__파트 ${i + 1}/${fileUrls.length}`);
+                else process.stdout.write(`\n    ▶ 파트 ${i + 1}/${fileUrls.length} 다운로드 중...\n`);
+            }
+
+            const partArgs = [
+                fileUrls[i],
+                "-o",
+                partTemplate,
+                "--no-playlist",
+                "--progress",
+                "--no-warnings",
+                "--newline",
+                "--merge-output-format",
+                "mp4",
+                "--concurrent-fragments",
+                "8",
+                ...(speedLimitMB !== null ? ["--limit-rate", `${speedLimitMB}M`] : []),
+                ...(ffmpegPath ? ["--ffmpeg-location", ffmpegPath] : []),
+            ];
+
+            try {
+                await this.runYtDlp(partArgs, onProgress);
+            } catch {
+                /* 파일 있으면 계속 */
+            }
+
+            if (fs.existsSync(partFile) && fs.statSync(partFile).size > 0) {
+                partFiles.push(partFile);
+            } else {
+                // 파일명이 다를 수 있으니 스캔
+                const alts = fs
+                    .readdirSync(tempDir)
+                    .filter((f) => f.startsWith(partBase) && f.endsWith(".mp4"))
+                    .map((f) => path.join(tempDir, f));
+                if (alts.length > 0) {
+                    fs.renameSync(alts[0], partFile);
+                    partFiles.push(partFile);
+                }
+            }
+        }
+
+        if (partFiles.length === 0) throw new Error("다운로드된 파트 파일 없음");
+
+        try {
+            if (partFiles.length === 1) {
+                fs.renameSync(partFiles[0], finalFile);
+            } else {
+                if (onProgress) onProgress(`__status__합치는 중...`);
+                else process.stdout.write(`\n    ▶ ${partFiles.length}개 파트 합치는 중...\n`);
+                const concatTemp = path.join(tempDir, `${tempBase}.mp4`);
+                await this.concatVideoParts(partFiles, concatTemp, ffmpegPath);
+                fs.renameSync(concatTemp, finalFile);
+            }
+        } finally {
+            // 파트 파일 명시적 삭제 (prefix 방식보다 정확)
+            for (const f of partFiles) {
+                try {
+                    if (fs.existsSync(f)) fs.unlinkSync(f);
+                } catch {
+                    /* 무시 */
+                }
+            }
+            // concat 리스트 파일도 정리
+            const listFile = path.join(tempDir, "_concat_list.txt");
+            try {
+                if (fs.existsSync(listFile)) fs.unlinkSync(listFile);
+            } catch {
+                /* 무시 */
+            }
+        }
     }
 
     // ── 목록 출력 ─────────────────────────────
 
     private printVodTable(vods: VodItem[], from: number, to: number): void {
-        const BAR = "─".repeat(72);
-        console.log(`\n┌${BAR}┐`);
-        console.log(`│ ${"#".padStart(4)}  ${"제목".padEnd(42)} ${"날짜".padEnd(12)} ${"길이".padEnd(8)} │`);
-        console.log(`├${BAR}┤`);
-
+        console.log();
         for (const vod of vods.slice(from - 1, to)) {
             const num = String(vod.index).padStart(4);
-            const title = vod.title.substring(0, 41).padEnd(42);
-            const date = vod.date.padEnd(12);
-            const dur = vod.duration.padEnd(8);
-            console.log(`│ ${num}  ${title} ${date} ${dur} │`);
+            const title = vod.title.length > 50 ? vod.title.substring(0, 49) + "…" : vod.title;
+            const meta: string[] = [vod.date];
+            if (vod.duration) meta.push(vod.duration);
+            if (vod.fileSize > 0) meta.push(formatFileSize(vod.fileSize));
+            console.log(`  ${num}.  ${title}`);
+            console.log(`         ${meta.join("  ·  ")}`);
         }
-
-        console.log(`└${BAR}┘`);
+        console.log();
     }
 
     // ── 메인 플로우 ───────────────────────────
@@ -429,7 +607,8 @@ class SoopVodDownloader {
             `  ${vods.length}번 (가장 오래됨): ${vods[vods.length - 1].title}  [${vods[vods.length - 1].date}]`,
         );
 
-        // 2) 범위 입력
+        // 2) VOD 목록 출력 후 범위 입력
+        this.printVodTable(vods, 1, vods.length);
         const savedFrom = this.settings.lastFrom;
         const savedTo = this.settings.lastTo ?? vods.length;
         console.log(`\n다운로드할 번호 범위를 입력하세요 (1 = 최신, ${vods.length} = 가장 오래됨)`);
@@ -462,13 +641,12 @@ class SoopVodDownloader {
             saveConfig(this.settings);
         }
 
-        // 3) 확인
+        // 3) 다운로드 순서 선택
         const count = to - from + 1;
-        const ok = await this.ask(`\n${from}번 ~ ${to}번, 총 ${count}개를 다운로드합니다. 계속하시겠습니까? (Y/n): `);
-        if (ok.toLowerCase() === "n") {
-            console.log("취소되었습니다.\n");
-            return;
-        }
+        console.log(`\n${from}번 ~ ${to}번, 총 ${count}개 다운로드 순서를 선택하세요:`);
+        console.log(`  1. 최신 → 과거 순서로 다운로드 (${from}번부터)`);
+        console.log(`  2. 과거 → 최신 순서로 다운로드 (${to}번부터)`);
+        const orderChoice = await this.askInt(`선택 (1~2): `, 1, 2);
 
         // 4) yt-dlp 확인
         if (!this.checkYtDlp()) {
@@ -511,15 +689,27 @@ class SoopVodDownloader {
         const ffmpegPath = this.resolveFfmpegPath();
         console.log(`ffmpeg  : ${ffmpegPath ?? "(PATH에서 자동 탐색)"}\n`);
 
+        // 디스크 여유 공간 사전 확인 (1GB 미만이면 중단)
+        const initialSpaceGB = this.getAvailableDiskSpaceGB(outputDir);
+        if (initialSpaceGB < 1) {
+            console.log(`⚠  저장 경로의 디스크 여유 공간이 ${initialSpaceGB.toFixed(2)}GB 밖에 없습니다.`);
+            console.log(`   최소 1GB 이상의 여유 공간이 필요합니다. 다운로드를 시작하지 않습니다.\n`);
+            return;
+        }
+
         // 6) 다운로드 실행 (순차/병렬 통합 대시보드)
         const concurrency = this.settings.concurrency;
-        const selected = vods.slice(from - 1, to);
+        const baseSelected = vods.slice(from - 1, to);
+        const selected = orderChoice === 2 ? [...baseSelected].reverse() : baseSelected;
         let successCount = 0;
         let failCount = 0;
         let skipCount = 0;
+        let diskFullStoppedVodNo: number | null = null;
 
-        const CONCURRENT_FRAGMENTS = 4;
         const totalSpeedMB = this.settings.speedLimitMB;
+        // --concurrent-fragments 8 로 세그먼트를 병렬 다운로드하므로
+        // --limit-rate 는 세그먼트 1개 기준으로 적용됨 → 총 목표 속도를 8로 나눠서 전달
+        const CONCURRENT_FRAGMENTS = 8;
         const perSpeedMB =
             totalSpeedMB !== null ? Math.max(0.1, totalSpeedMB / concurrency / CONCURRENT_FRAGMENTS) : null;
 
@@ -527,21 +717,27 @@ class SoopVodDownloader {
             const total = selected.length;
             let nextIdx = 0;
 
-            // 슬롯별 현재 VOD 번호("1", "2", ...) 와 퍼센트("45%")
+            // 슬롯별 현재 VOD 번호, 파트 라벨, 진행률+속도
             const slotNo: string[] = Array.from({ length: concurrency }, () => "-");
+            const slotPart: string[] = Array.from({ length: concurrency }, () => "");
             const slotPct: string[] = Array.from({ length: concurrency }, () => "-");
 
             const parsePct = (line: string): string => {
                 const mPct = line.match(/(\d+\.?\d*)%/);
                 const mSpd = line.match(/at\s+([\d.]+\s*\S+\/s)/i);
-                const pct = mPct ? `${parseFloat(mPct[1]).toFixed(2)}%` : "...";
+                const pct = mPct ? `${parseFloat(mPct[1]).toFixed(1)}%` : "...";
                 const spd = mSpd ? mSpd[1].trim() : null;
-                return spd ? `${pct} · ${spd}` : pct;
+                return spd ? `${pct}  ${spd}` : pct;
             };
 
             const printLine = (): void => {
-                const parts = Array.from({ length: concurrency }, (_, s) => `(${slotNo[s]}) ${slotPct[s]}`);
-                process.stdout.write(`\r${parts.join(" | ")}   `);
+                const parts = Array.from({ length: concurrency }, (_, s) => {
+                    const no = `#${slotNo[s]}`;
+                    const part = slotPart[s] ? `  ${slotPart[s]}` : "";
+                    const pct = `  ${slotPct[s]}`;
+                    return `${no}${part}${pct}`;
+                });
+                process.stdout.write(`\r${parts.join("   |   ")}   `);
             };
 
             console.log();
@@ -549,15 +745,30 @@ class SoopVodDownloader {
 
             const runSlot = async (slot: number): Promise<void> => {
                 while (nextIdx < total) {
+                    // 디스크 여유 공간 확인 (1GB 미만이면 중단)
+                    const availGB = this.getAvailableDiskSpaceGB(outputDir);
+                    if (availGB < 1) {
+                        if (diskFullStoppedVodNo === null && nextIdx < total) {
+                            diskFullStoppedVodNo = selected[nextIdx].index;
+                        }
+                        nextIdx = total; // 모든 슬롯 종료
+                        return;
+                    }
                     const idx = nextIdx++;
                     const vod = selected[idx];
-                    slotNo[slot] = String(idx + 1);
+                    slotNo[slot] = String(vod.index);
+                    slotPart[slot] = "";
                     slotPct[slot] = "0%";
                     try {
                         let skipped = false;
                         await this.downloadOne(vod, outputDir, perSpeedMB, (progressLine) => {
                             if (progressLine === "__skipped__") {
                                 skipped = true;
+                                return;
+                            }
+                            if (progressLine.startsWith("__status__")) {
+                                slotPart[slot] = progressLine.slice(10);
+                                slotPct[slot] = "";
                                 return;
                             }
                             slotPct[slot] = parsePct(progressLine);
@@ -574,6 +785,7 @@ class SoopVodDownloader {
                         failCount++;
                     }
                     slotNo[slot] = "-";
+                    slotPart[slot] = "";
                     slotPct[slot] = "-";
                 }
             };
@@ -588,6 +800,9 @@ class SoopVodDownloader {
         const sep = "═".repeat(44);
         console.log(sep);
         console.log(`다운로드 완료  성공: ${successCount}개  /  건너뜀: ${skipCount}개  /  실패: ${failCount}개`);
+        if (diskFullStoppedVodNo !== null) {
+            console.log(`⚠  디스크 용량 부족으로 ${diskFullStoppedVodNo}번 VOD에서 다운로드가 중단되었습니다.`);
+        }
         console.log(`저장 위치: ${outputDir}`);
         console.log(sep + "\n");
     }
